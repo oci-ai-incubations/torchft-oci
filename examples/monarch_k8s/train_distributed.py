@@ -15,7 +15,7 @@ from typing import Dict
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, HostMesh, ProcMesh, this_host
-from monarch.job import SlurmJob
+from monarch.job.kubernetes import KubernetesJob, ImageSpec
 from monarch.utils import setup_env_for_distributed
 from torchtitan.config import ConfigManager, JobConfig
 from torchtitan.tools.logging import init_logger, logger
@@ -24,21 +24,29 @@ from utils.failure import Failure, FailureActor, FailureController
 
 
 # ==== Allocation boilerplate ====
-class MonarchSlurm:
+class MonarchKubernetes:
     job_name_prefix: str = "monarch-torchft"
 
-    def __init__(self):
-        self.job_handles: Dict[str, SlurmJob] = {}
+    def __init__(
+        self,
+        namespace: str,
+        image_spec: ImageSpec | None = None,
+        timeout: int | None = None,
+    ):
+        self.namespace = namespace
+        self.image_spec = image_spec
+        self.timeout = timeout
+        self.job_handles: Dict[str, KubernetesJob] = {}
         atexit.register(self.kill_jobs)
 
     async def get_or_create_job(
-        self, mesh_name: str, nodes_per_mesh: int = 1, gpus_per_node: int = 8
+        self, mesh_name: str, num_replicas: int = 1, gpus_per_node: int = 8
     ) -> None:
-        job = SlurmJob(
-            meshes={mesh_name: nodes_per_mesh},
-            gpus_per_node=gpus_per_node,
-            job_name=f"{self.job_name_prefix}-{mesh_name}",
-        )
+        job = KubernetesJob(namespace=self.namespace, timeout=self.timeout)
+        if self.image_spec is not None:
+            job.add_mesh(mesh_name, num_replicas, image_spec=self.image_spec)
+        else:
+            job.add_mesh(mesh_name, num_replicas)
         job.apply()
         self.job_handles[mesh_name] = job
 
@@ -89,7 +97,7 @@ class TrainingActor(Actor):
     def __init__(self, job_config: JobConfig, replica_id: int) -> None:
         self.job_config = job_config
         rank = current_rank().rank
-        self.uid = f"[replica_{replica_id}_trainer_{rank}]"
+        self.uid = f"[replica{replica_id}_trainer_{rank}]"
 
     @endpoint
     async def start_training(self, lighthouse_address: str) -> None:
@@ -121,6 +129,9 @@ class JobSpec:
     hosts_per_replica: int
     gpus_per_node: int
     with_failures: bool
+    namespace: str = ""
+    image_spec: ImageSpec | None = None
+    timeout: int | None = None
     lighthouse_address: str = ""
 
 
@@ -135,11 +146,11 @@ class Replica:
 # This does not currently benefit from being an actor, but will once
 # Monarch supervision APIs are fleshed out.
 class ReplicaActor(Actor):
-    def __init__(self, spec: JobSpec, replica_id: int, scheduler: MonarchSlurm) -> None:
+    def __init__(self, spec: JobSpec, replica_id: int, scheduler: MonarchKubernetes) -> None:
         self.spec = deepcopy(spec)
         self.replica_id = replica_id
 
-        self.uid = f"[replica_{replica_id}]"
+        self.uid = f"[replica{replica_id}]"
         self.spec.job_config.fault_tolerance.replica_id = self.replica_id
         self.scheduler = scheduler
 
@@ -151,7 +162,7 @@ class ReplicaActor(Actor):
         logger.info(f"{self.uid} Spawning trainers")
 
         trainers_proc_mesh = self.scheduler.proc_mesh(
-            f"replica_{self.replica_id}",
+            f"replica{self.replica_id}",
             num_procs=self.spec.gpus_per_node,
         )
 
@@ -204,7 +215,11 @@ class OrchestrationManager:
         self.lighthouse_actor: LighthouseActor | None = None
         self.lighthouse_mesh: ProcMesh | None = None
 
-        self.scheduler = MonarchSlurm()
+        self.scheduler = MonarchKubernetes(
+            namespace=spec.namespace,
+            image_spec=spec.image_spec,
+            timeout=spec.timeout,
+        )
 
     async def start_training(self) -> None:
         logger.info(
@@ -213,7 +228,7 @@ class OrchestrationManager:
 
         for replica_id in range(self.spec.replica_count):
             await self.scheduler.get_or_create_job(
-                f"replica_{replica_id}", self.spec.hosts_per_replica
+                f"replica{replica_id}", self.spec.hosts_per_replica
             )
 
         mesh_futures = {}
@@ -274,9 +289,9 @@ class OrchestrationManager:
             logger.info(
                 f"[Controller] Replica {replica_id} has failed {attempt_number} times. Getting new allocation."
             )
-            self.scheduler.kill_job(f"replica_{replica_id}")
+            self.scheduler.kill_job(f"replica{replica_id}")
             await self.scheduler.get_or_create_job(
-                f"replica_{replica_id}", self.spec.hosts_per_replica
+                f"replica{replica_id}", self.spec.hosts_per_replica
             )
         delay = 0 if not attempt_number else PROC_ATTEMPT_DELAY
         logger.info(
@@ -364,6 +379,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable the failure injector utility (default: False)",
     )
+    parser.add_argument(
+        "--namespace",
+        type=str,
+        required=True,
+        help="Kubernetes namespace for job scheduling",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Container image for provisioning mode (e.g., ghcr.io/meta-pytorch/monarch:latest). If not set, uses attach-only mode.",
+    )
+    parser.add_argument(
+        "--gpu-resources",
+        type=int,
+        default=None,
+        help="Number of GPUs to request per pod when provisioning",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Maximum seconds to wait for pods to be ready (default: wait indefinitely)",
+    )
 
     return parser.parse_args()
 
@@ -411,6 +450,13 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
     config_manager = ConfigManager()
     job_config = config_manager.parse_args(default_args)
 
+    image_spec = None
+    if args.image:
+        resources = None
+        if args.gpu_resources:
+            resources = {"nvidia.com/gpu": args.gpu_resources}
+        image_spec = ImageSpec(image=args.image, resources=resources)
+
     return JobSpec(
         job_config=job_config,
         remote_lighthouse=args.remote_lighthouse,
@@ -418,6 +464,9 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
         hosts_per_replica=args.host_per_replica,
         gpus_per_node=args.gpu_per_node,
         with_failures=args.with_failures,
+        namespace=args.namespace,
+        image_spec=image_spec,
+        timeout=args.timeout,
     )
 
 
