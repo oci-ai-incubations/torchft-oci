@@ -22,27 +22,17 @@ Pods must already exist in the specified namespace.
 Enabled by passing `--image` (and optionally `--gpu-resources`).
 
 ##### USAGE
-    python train_distributed.py --help
-
-    Attach-only mode with 2 replicas (pods must already exist):
-        python train_distributed.py --namespace monarch-tests
-
-    Provisioning mode with 2 replicas, each with 8 GPUs:
-        python train_distributed.py --namespace monarch-tests \
-            --image ghcr.io/meta-pytorch/monarch:latest \
-            --gpu-resources 8
-
     Custom configuration:
-        python train_distributed.py --namespace monarch-tests \
-            --replica-count 3 --gpu-per-node 8 \
-            --host-per-replica 2 --training-steps 100 \
-            --image my-image:tag --gpu-resources 8
-
-    With remote TorchFT lighthouse:
-        python train_distributed.py --namespace monarch-tests --remote-lighthouse
-
-    With pod readiness timeout:
-        python train_distributed.py --namespace monarch-tests --timeout 300
+        python train_distributed.py \
+            --num-replicas 4 \
+            --gpus-per-host 4 \
+            --training-steps 100 \
+            --model-config debug_model.toml \
+            --dataset-path c4_test \
+            --tokenizer-path debug_tokenizer \
+            --with-failures True \
+            --namespace monarch-tests-titan-torchft \
+            --image ocir.ap-sydney-1.oci.oraclecloud.com/iduyx1qnmway/meta-pytorch/monarch:0.4.0rc1-cuda12.8
 
 ##### KEY COMPONENTS
 - LighthouseActor: Coordination server for fault tolerance
