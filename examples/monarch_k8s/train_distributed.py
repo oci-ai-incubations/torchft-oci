@@ -40,7 +40,7 @@ class MonarchKubernetes:
         atexit.register(self.kill_jobs)
 
     async def get_or_create_job(
-        self, mesh_name: str, num_replicas: int = 1, gpus_per_node: int = 8
+        self, mesh_name: str, num_replicas: int = 1, gpus_per_host: int = 8
     ) -> None:
         job = KubernetesJob(namespace=self.namespace, timeout=self.timeout)
         if self.image_spec is not None:
@@ -125,9 +125,7 @@ class TrainingActor(Actor):
 class JobSpec:
     job_config: JobConfig
     remote_lighthouse: bool
-    replica_count: int
-    hosts_per_replica: int
-    gpus_per_node: int
+    gpus_per_host: int
     with_failures: bool
     namespace: str = ""
     image_spec: ImageSpec | None = None
@@ -163,7 +161,7 @@ class ReplicaActor(Actor):
 
         trainers_proc_mesh = self.scheduler.proc_mesh(
             f"replica{self.replica_id}",
-            num_procs=self.spec.gpus_per_node,
+            num_procs=self.spec.gpus_per_host,
         )
 
         async with trainers_proc_mesh:
@@ -223,16 +221,16 @@ class OrchestrationManager:
 
     async def start_training(self) -> None:
         logger.info(
-            f"[Controller] Creating training system with {self.spec.replica_count} replicas"
+            f"[Controller] Creating training system with {self.spec.num_replicas} replicas"
         )
 
-        for replica_id in range(self.spec.replica_count):
+        for replica_id in range(self.spec.num_replicas):
             await self.scheduler.get_or_create_job(
-                f"replica{replica_id}", self.spec.hosts_per_replica
+                f"replica{replica_id}", self.spec.gpus_per_host
             )
 
         mesh_futures = {}
-        for i in range(self.spec.replica_count):
+        for i in range(self.spec.num_replicas):
             mesh_futures[i] = asyncio.create_task(self._run_replica(i, 0))
 
         failure_future = None
@@ -291,7 +289,7 @@ class OrchestrationManager:
             )
             self.scheduler.kill_job(f"replica{replica_id}")
             await self.scheduler.get_or_create_job(
-                f"replica{replica_id}", self.spec.hosts_per_replica
+                f"replica{replica_id}", self.spec.gpus_per_host
             )
         delay = 0 if not attempt_number else PROC_ATTEMPT_DELAY
         logger.info(
@@ -337,13 +335,10 @@ def parse_args() -> argparse.Namespace:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     parser.add_argument(
-        "--replica-count", type=int, default=2, help="Number of replicas (default: 2)"
+        "--num-replicas", type=int, default=2, help="Number of replicas (default: 2)"
     )
     parser.add_argument(
-        "--gpu-per-node", type=int, default=8, help="GPUs per replica (default: 8)"
-    )
-    parser.add_argument(
-        "--host-per-replica", type=int, default=1, help="Hosts per replica (default: 1)"
+        "--gpus-per-host", type=int, default=8, help="GPUs per POD (default: 8)"
     )
     parser.add_argument(
         "--remote-lighthouse",
@@ -392,12 +387,6 @@ def parse_args() -> argparse.Namespace:
         help="Container image for provisioning mode (e.g., ghcr.io/meta-pytorch/monarch:latest). If not set, uses attach-only mode.",
     )
     parser.add_argument(
-        "--gpu-resources",
-        type=int,
-        default=None,
-        help="Number of GPUs to request per pod when provisioning",
-    )
-    parser.add_argument(
         "--timeout",
         type=int,
         default=None,
@@ -408,7 +397,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def make_job_spec(args: argparse.Namespace) -> JobSpec:
-    data_parallel_shard_degree = args.gpu_per_node * args.host_per_replica
+    data_parallel_shard_degree = args.num_replicas * args.gpus_per_host
 
     output_path = "./outputs"
     training_dataset = args.dataset_path.split("/")[-1]
@@ -425,7 +414,7 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
         "1",
         "--fault_tolerance.enable",
         "--fault_tolerance.group_size",
-        str(args.replica_count),
+        str(args.num_replicas),
         "--fault_tolerance.process_group",
         "nccl",
         "--fault_tolerance.process_group_timeout_ms",
@@ -453,16 +442,15 @@ def make_job_spec(args: argparse.Namespace) -> JobSpec:
     image_spec = None
     if args.image:
         resources = None
-        if args.gpu_resources:
-            resources = {"nvidia.com/gpu": args.gpu_resources}
+        if args.gpus_per_host:
+            resources = {"nvidia.com/gpu": args.gpus_per_host}
         image_spec = ImageSpec(image=args.image, resources=resources)
 
     return JobSpec(
         job_config=job_config,
         remote_lighthouse=args.remote_lighthouse,
-        replica_count=args.replica_count,
-        hosts_per_replica=args.host_per_replica,
-        gpus_per_node=args.gpu_per_node,
+        num_replicas=args.num_replicas,
+        gpus_per_host=args.gpus_per_host,
         with_failures=args.with_failures,
         namespace=args.namespace,
         image_spec=image_spec,
