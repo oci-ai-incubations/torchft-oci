@@ -40,15 +40,18 @@ class MonarchKubernetes:
         atexit.register(self.kill_jobs)
 
     async def get_or_create_job(
-        self, mesh_name: str, num_replicas: int = 1, gpus_per_host: int = 8
+        self, mesh_name: str #, num_replicas: int = 1
     ) -> None:
         job = KubernetesJob(namespace=self.namespace, timeout=self.timeout)
         if self.image_spec is not None:
-            job.add_mesh(mesh_name, num_replicas, image_spec=self.image_spec)
+            # job.add_mesh(mesh_name, num_replicas, image_spec=self.image_spec)
+            job.add_mesh(mesh_name, image_spec=self.image_spec)
         else:
-            job.add_mesh(mesh_name, num_replicas)
+            # job.add_mesh(mesh_name, num_replicas)
+            job.add_mesh(mesh_name)
         job.apply()
-        self.job_handles[mesh_name] = job
+        # Note: add_mesh adds -0, -1, -2, ... at the end of the created POD name
+        self.job_handles[mesh_name + "-0"] = job
 
     def kill_jobs(self):
         for mesh_name in self.job_handles.keys():
@@ -160,7 +163,7 @@ class ReplicaActor(Actor):
         logger.info(f"{self.uid} Spawning trainers")
 
         trainers_proc_mesh = self.scheduler.proc_mesh(
-            f"replica{self.replica_id}",
+            f"replica-{self.replica_id}-0",
             num_procs=self.spec.gpus_per_host,
         )
 
@@ -224,10 +227,18 @@ class OrchestrationManager:
             f"[Controller] Creating training system with {self.spec.num_replicas} replicas"
         )
 
+        # If num_replicas = 4, this loop should create:
+        # replica-0-0
+        # replica-1-0
+        # replica-2-0
+        # replica-3-0
         for replica_id in range(self.spec.num_replicas):
             await self.scheduler.get_or_create_job(
-                f"replica{replica_id}", self.spec.gpus_per_host
+                f"replica-{replica_id}", self.spec.num_replicas
             )
+
+        # The right way to create it:
+        # await self.scheduler.get_or_create_job(f"replica", self.spec.num_replicas)
 
         mesh_futures = {}
         for i in range(self.spec.num_replicas):
@@ -287,9 +298,9 @@ class OrchestrationManager:
             logger.info(
                 f"[Controller] Replica {replica_id} has failed {attempt_number} times. Getting new allocation."
             )
-            self.scheduler.kill_job(f"replica{replica_id}")
+            self.scheduler.kill_job(f"replica-{replica_id}-0")
             await self.scheduler.get_or_create_job(
-                f"replica{replica_id}", self.spec.gpus_per_host
+                f"replica-{replica_id}"
             )
         delay = 0 if not attempt_number else PROC_ATTEMPT_DELAY
         logger.info(
